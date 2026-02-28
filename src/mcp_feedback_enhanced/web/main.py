@@ -7,6 +7,7 @@ Web UI 主要管理類
 """
 
 import asyncio
+import atexit
 import concurrent.futures
 import os
 import threading
@@ -29,7 +30,7 @@ from .models import CleanupReason, SessionStatus, WebFeedbackSession
 from .routes import setup_routes
 from .utils import get_browser_opener
 from .utils.compression_config import get_compression_manager
-from .utils.port_manager import PortManager
+from .utils.port_manager import PortManager, PortRegistry
 
 
 class WebUIManager:
@@ -142,6 +143,9 @@ class WebUIManager:
         # 同步初始化基本組件
         self._init_basic_components()
 
+        # 注冊 atexit 處理器：使用綁定方法以便在退出時讀取最新端口值
+        atexit.register(self._release_port_on_exit)
+
         debug_log(f"WebUIManager 基本初始化完成，將在 {self.host}:{self.port} 啟動")
         debug_log("回饋模式: web")
 
@@ -156,6 +160,20 @@ class WebUIManager:
 
         # 設置路由（必須同步）
         setup_routes(self)
+
+    def _release_port_on_exit(self):
+        """atexit 回調：釋放當前端口的注冊表條目"""
+        PortRegistry.release_port(self.port)
+
+    def _update_registered_port(self, old_port: int, new_port: int):
+        """端口變更時同步更新注冊表"""
+        PortRegistry.release_port(old_port)
+        try:
+            PortRegistry.allocate_port(
+                base_port=new_port, host=self.host, max_attempts=1
+            )
+        except Exception:
+            debug_log(f"註冊新端口 {new_port} 到注冊表失敗（端口仍可正常使用）")
 
     async def _init_async_components(self):
         """異步初始化組件（並行執行）"""
@@ -500,14 +518,18 @@ class WebUIManager:
                                 f"(PID: {process_info['pid']}) 佔用"
                             )
 
-                        # 自動尋找新端口
+                        # 自動尋找新端口（find_free_port_enhanced 會通過注冊表分配）
                         try:
+                            old_port = self.port
                             new_port = PortManager.find_free_port_enhanced(
                                 preferred_port=self.port,
-                                auto_cleanup=False,  # 不自動清理其他進程
+                                auto_cleanup=False,
                                 host=self.host,
                             )
-                            debug_log(f"自動切換端口: {self.port} → {new_port}")
+                            debug_log(f"自動切換端口: {old_port} → {new_port}")
+                            # 釋放舊端口的注冊表條目（新端口已由 find_free_port_enhanced 注冊）
+                            if new_port != old_port:
+                                PortRegistry.release_port(old_port)
                             self.port = new_port
                         except RuntimeError as port_error:
                             error_id = ErrorHandler.log_error_with_context(
@@ -571,8 +593,9 @@ class WebUIManager:
                             debug_log(
                                 f"端口 {self.port} 啟動失敗 (OSError)，嘗試下一個端口"
                             )
-                            # 嘗試下一個端口
+                            old_port = self.port
                             self.port = self.port + 1
+                            self._update_registered_port(old_port, self.port)
                         else:
                             debug_log("已達到最大重試次數，無法啟動伺服器")
                             break
@@ -1079,28 +1102,100 @@ class WebUIManager:
             f"停止服務時清理了 {session_count} 個會話，耗時: {cleanup_duration:.2f}秒"
         )
 
+        # 從端口注冊表釋放端口
+        PortRegistry.release_port(self.port)
+
         # 停止伺服器（注意：uvicorn 的 graceful shutdown 需要額外處理）
         if self.server_thread is not None and self.server_thread.is_alive():
             debug_log("正在停止 Web UI 服務")
 
 
-# 全域實例
-_web_ui_manager: WebUIManager | None = None
+class WebUIPool:
+    """WebUI 管理器池 - 支持多會話並發使用獨立端口
+
+    同一 MCP 進程中，多個 interactive_feedback 並發調用各自獲得獨立的
+    WebUIManager 實例（獨立端口、獨立 Web UI）。順序調用復用空閒管理器。
+    """
+
+    def __init__(self):
+        self._idle: list[WebUIManager] = []
+        self._busy: dict[str, WebUIManager] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self) -> WebUIManager:
+        """獲取可用的 WebUIManager（優先復用空閒的，否則創建新的）"""
+        with self._lock:
+            if self._idle:
+                manager = self._idle.pop(0)
+                debug_log(
+                    f"復用空閒 WebUIManager (port={manager.port})，"
+                    f"空閒池剩餘: {len(self._idle)}"
+                )
+                return manager
+
+        manager = WebUIManager()
+        debug_log(f"創建新 WebUIManager (port={manager.port})")
+        return manager
+
+    def mark_busy(self, session_id: str, manager: WebUIManager):
+        """將管理器標記為忙碌"""
+        with self._lock:
+            self._busy[session_id] = manager
+
+    def release(self, session_id: str):
+        """釋放管理器回空閒池"""
+        with self._lock:
+            manager = self._busy.pop(session_id, None)
+            if manager:
+                self._idle.append(manager)
+                debug_log(
+                    f"WebUIManager (port={manager.port}) 釋放回池，"
+                    f"空閒: {len(self._idle)}，忙碌: {len(self._busy)}"
+                )
+
+    def stop_all(self):
+        """停止所有管理器並清空池"""
+        with self._lock:
+            all_managers = self._idle + list(self._busy.values())
+            self._idle.clear()
+            self._busy.clear()
+        for manager in all_managers:
+            try:
+                manager.stop()
+            except Exception as e:
+                debug_log(f"停止 WebUIManager 失敗: {e}")
+        debug_log(f"已停止 {len(all_managers)} 個 WebUIManager")
+
+    def get_any_manager(self) -> WebUIManager:
+        """獲取任意一個管理器（向後兼容用途，如桌面模式關閉）"""
+        with self._lock:
+            if self._busy:
+                return next(iter(self._busy.values()))
+            if self._idle:
+                return self._idle[0]
+        return WebUIManager()
+
+
+# 全域管理器池
+_web_ui_pool = WebUIPool()
 
 
 def get_web_ui_manager() -> WebUIManager:
-    """獲取 Web UI 管理器實例"""
-    global _web_ui_manager
-    if _web_ui_manager is None:
-        _web_ui_manager = WebUIManager()
-    return _web_ui_manager
+    """獲取 Web UI 管理器（向後兼容）
+
+    注意：多會話並發時不應使用此函數，應透過 launch_web_feedback_ui 自動管理。
+    """
+    return _web_ui_pool.get_any_manager()
 
 
 async def launch_web_feedback_ui(
     project_directory: str, summary: str, timeout: int = 600
 ) -> dict:
     """
-    啟動 Web 回饋介面並等待用戶回饋 - 重構為使用根路徑
+    啟動 Web 回饋介面並等待用戶回饋
+
+    每個並發調用獲得獨立的 WebUIManager 和端口，互不衝突。
+    順序調用復用空閒的管理器（保持相同端口和瀏覽器標籤）。
 
     Args:
         project_directory: 專案目錄路徑
@@ -1110,64 +1205,52 @@ async def launch_web_feedback_ui(
     Returns:
         dict: 回饋結果，包含 logs、interactive_feedback 和 images
     """
-    manager = get_web_ui_manager()
+    manager = _web_ui_pool.acquire()
+    session_id = manager.create_session(project_directory, summary)
+    _web_ui_pool.mark_busy(session_id, manager)
 
-    # 創建新會話（每次AI調用都應該創建新會話）
-    manager.create_session(project_directory, summary)
     session = manager.get_current_session()
-
     if not session:
+        _web_ui_pool.release(session_id)
         raise RuntimeError("無法創建回饋會話")
 
     # 啟動伺服器（如果尚未啟動）
     if manager.server_thread is None or not manager.server_thread.is_alive():
         manager.start_server()
 
-    # 檢查是否為桌面模式
     desktop_mode = os.environ.get("MCP_DESKTOP_MODE", "").lower() == "true"
-
-    # 使用根路徑 URL
-    feedback_url = manager.get_server_url()  # 直接使用根路徑
+    feedback_url = manager.get_server_url()
 
     if desktop_mode:
-        # 桌面模式：啟動桌面應用程式
         debug_log("檢測到桌面模式，啟動桌面應用程式...")
         has_active_tabs = await manager.launch_desktop_app(feedback_url)
     else:
-        # Web 模式：智能開啟瀏覽器
         has_active_tabs = await manager.smart_open_browser(feedback_url)
 
     debug_log(f"[DEBUG] 服務器地址: {feedback_url}")
 
-    # 如果檢測到活躍標籤頁，消息已在 smart_open_browser 中發送，無需額外處理
     if has_active_tabs:
         debug_log("檢測到活躍標籤頁，會話更新通知已發送")
 
     try:
-        # 等待用戶回饋，傳遞 timeout 參數
         result = await session.wait_for_feedback(timeout)
         debug_log("收到用戶回饋")
         return result
     except TimeoutError:
         debug_log("會話超時")
-        # 資源已在 wait_for_feedback 中清理，這裡只需要記錄和重新拋出
         raise
     except Exception as e:
         debug_log(f"會話發生錯誤: {e}")
         raise
     finally:
-        # 注意：不再自動清理會話和停止服務器，保持持久性
-        # 會話將保持活躍狀態，等待下次 MCP 調用
-        debug_log("會話保持活躍狀態，等待下次 MCP 調用")
+        _web_ui_pool.release(session_id)
+        debug_log(f"會話 {session_id} 回饋完成，管理器已釋放回池")
 
 
 def stop_web_ui():
-    """停止 Web UI 服務"""
-    global _web_ui_manager
-    if _web_ui_manager:
-        _web_ui_manager.stop()
-        _web_ui_manager = None
-        debug_log("Web UI 服務已停止")
+    """停止所有 Web UI 服務"""
+    _web_ui_pool.stop_all()
+    debug_log("所有 Web UI 服務已停止")
 
 
 # 測試用主函數

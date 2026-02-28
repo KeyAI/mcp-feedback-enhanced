@@ -8,6 +8,7 @@ Web UI 工具模組
 
 from .browser import get_browser_opener
 from .network import find_free_port
+from .port_manager import PortRegistry
 
 
-__all__ = ["find_free_port", "get_browser_opener"]
+__all__ = ["PortRegistry", "find_free_port", "get_browser_opener"]

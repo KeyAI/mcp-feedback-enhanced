@@ -5,15 +5,241 @@
 - 智能端口查找
 - 進程檢測和清理
 - 端口衝突解決
+- 多實例端口注冊表（跨進程協調）
 """
 
+import json
+import os
 import socket
+import sys
 import time
+from contextlib import contextmanager
 from typing import Any
 
 import psutil
 
 from ...debug import debug_log
+
+
+class PortRegistry:
+    """端口注冊表 - 跨進程端口分配協調
+
+    使用文件鎖實現原子性端口分配，防止多個 MCP 實例之間的端口衝突。
+    注冊表文件存儲在 ~/.mcp-feedback-enhanced/port-registry.json。
+    """
+
+    REGISTRY_DIR = os.path.expanduser("~/.mcp-feedback-enhanced")
+    REGISTRY_FILE = "port-registry.json"
+    LOCK_FILE = "port-registry.lock"
+
+    @classmethod
+    def _get_registry_path(cls) -> str:
+        return os.path.join(cls.REGISTRY_DIR, cls.REGISTRY_FILE)
+
+    @classmethod
+    def _get_lock_path(cls) -> str:
+        return os.path.join(cls.REGISTRY_DIR, cls.LOCK_FILE)
+
+    @classmethod
+    def _ensure_dir(cls) -> None:
+        os.makedirs(cls.REGISTRY_DIR, exist_ok=True)
+
+    @classmethod
+    @contextmanager
+    def _file_lock(cls):
+        """跨平台文件鎖上下文管理器"""
+        cls._ensure_dir()
+        lock_path = cls._get_lock_path()
+        lock_fd = open(lock_path, "w")  # noqa: SIM115
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                lock_fd.write(" ")
+                lock_fd.flush()
+                lock_fd.seek(0)
+                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    lock_fd.seek(0)
+                    msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lock_fd.close()
+
+    @classmethod
+    def _read_registry(cls) -> dict:
+        """讀取注冊表文件，損壞時重建"""
+        path = cls._get_registry_path()
+        if not os.path.exists(path):
+            return {"instances": {}}
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or "instances" not in data:
+                return {"instances": {}}
+            return data
+        except (json.JSONDecodeError, OSError):
+            return {"instances": {}}
+
+    @classmethod
+    def _write_registry(cls, data: dict) -> None:
+        cls._ensure_dir()
+        path = cls._get_registry_path()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    @classmethod
+    def _is_process_alive(cls, pid: int, start_time: float) -> bool:
+        """檢查進程是否存活且匹配預期的啟動時間（防止 PID 重用）"""
+        if not psutil.pid_exists(pid):
+            return False
+        try:
+            proc = psutil.Process(pid)
+            if abs(proc.create_time() - start_time) > 2.0:
+                return False
+            return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return False
+
+    @classmethod
+    def _cleanup_stale_entries(cls, registry: dict) -> int:
+        """清理過期注冊條目（PID 已不存活的）。必須在文件鎖內調用。"""
+        stale_ports = []
+        for port_str, info in registry.get("instances", {}).items():
+            pid = info.get("pid")
+            start_time = info.get("start_time", 0)
+            if pid is None or not cls._is_process_alive(pid, start_time):
+                stale_ports.append(port_str)
+        for port_str in stale_ports:
+            del registry["instances"][port_str]
+            debug_log(f"清理過期端口注冊: port={port_str}")
+        return len(stale_ports)
+
+    @staticmethod
+    def _is_port_available(host: str, port: int) -> bool:
+        """輕量級端口可用性檢查"""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind((host, port))
+                return True
+        except OSError:
+            return False
+
+    @classmethod
+    def allocate_port(
+        cls,
+        base_port: int = 8765,
+        host: str = "127.0.0.1",
+        max_attempts: int = 100,
+    ) -> int:
+        """原子性端口分配：在文件鎖保護下查找、檢查、注冊端口
+
+        從 base_port 開始遞增查找，跳過已注冊和不可用的端口。
+        整個操作在文件鎖內完成，消除 TOCTOU 競態條件。
+
+        Args:
+            base_port: 基準端口號
+            host: 綁定主機地址
+            max_attempts: 最大嘗試次數
+
+        Returns:
+            分配到的可用端口號
+
+        Raises:
+            RuntimeError: 找不到可用端口
+        """
+        with cls._file_lock():
+            registry = cls._read_registry()
+            cleaned = cls._cleanup_stale_entries(registry)
+            if cleaned > 0:
+                debug_log(f"端口注冊表清理了 {cleaned} 個過期條目")
+
+            registered_ports = {
+                int(p) for p in registry.get("instances", {})
+            }
+
+            for i in range(max_attempts):
+                port = base_port + i
+                if port > 65535:
+                    break
+                if port in registered_ports:
+                    continue
+                if cls._is_port_available(host, port):
+                    registry["instances"][str(port)] = {
+                        "pid": os.getpid(),
+                        "start_time": time.time(),
+                    }
+                    cls._write_registry(registry)
+                    debug_log(
+                        f"端口注冊表分配端口: {port} (PID: {os.getpid()})"
+                    )
+                    return port
+
+            raise RuntimeError(
+                f"無法在 {base_port}-{base_port + max_attempts} 範圍內找到可用端口。"
+                f"活躍實例: {len(registered_ports)} 個"
+            )
+
+    @classmethod
+    def release_port(cls, port: int) -> None:
+        """釋放已注冊的端口（僅釋放當前進程注冊的）"""
+        try:
+            with cls._file_lock():
+                registry = cls._read_registry()
+                port_str = str(port)
+                info = registry.get("instances", {}).get(port_str)
+                if info and info.get("pid") == os.getpid():
+                    del registry["instances"][port_str]
+                    cls._write_registry(registry)
+                    debug_log(f"端口注冊表釋放端口: {port}")
+        except Exception as e:
+            debug_log(f"釋放端口 {port} 注冊時發生錯誤: {e}")
+
+    @classmethod
+    def is_sibling_mcp_process(cls, port: int) -> bool:
+        """檢查端口是否由活躍的兄弟 MCP 實例占用"""
+        try:
+            with cls._file_lock():
+                registry = cls._read_registry()
+                port_str = str(port)
+                info = registry.get("instances", {}).get(port_str)
+                if not info:
+                    return False
+                pid = info.get("pid")
+                start_time = info.get("start_time", 0)
+                if pid is None:
+                    return False
+                return pid != os.getpid() and cls._is_process_alive(
+                    pid, start_time
+                )
+        except Exception:
+            return False
+
+    @classmethod
+    def get_active_instances(cls) -> dict:
+        """獲取所有活躍的注冊實例"""
+        try:
+            with cls._file_lock():
+                registry = cls._read_registry()
+                cls._cleanup_stale_entries(registry)
+                cls._write_registry(registry)
+                return dict(registry.get("instances", {}))
+        except Exception as e:
+            debug_log(f"獲取活躍實例列表時發生錯誤: {e}")
+            return {}
 
 
 class PortManager:
@@ -151,7 +377,10 @@ class PortManager:
         max_attempts: int = 100,
     ) -> int:
         """
-        增強的端口查找功能
+        增強的端口查找功能（支持多實例協調）
+
+        優先使用 PortRegistry 進行原子性端口分配，消除多實例間的競態條件。
+        當注冊表不可用時，回退到傳統的端口查找邏輯。
 
         Args:
             preferred_port: 偏好端口號
@@ -165,12 +394,21 @@ class PortManager:
         Raises:
             RuntimeError: 如果找不到可用端口
         """
-        # 首先嘗試偏好端口
+        # 優先使用注冊表進行原子性端口分配
+        try:
+            port = PortRegistry.allocate_port(
+                base_port=preferred_port, host=host, max_attempts=max_attempts
+            )
+            return port
+        except Exception as e:
+            debug_log(f"端口注冊表分配失敗，回退到傳統方式: {e}")
+
+        # === 回退邏輯：傳統端口查找（注冊表不可用時） ===
+
         if PortManager.is_port_available(host, preferred_port):
             debug_log(f"偏好端口 {preferred_port} 可用")
             return preferred_port
 
-        # 如果偏好端口被占用且啟用自動清理
         if auto_cleanup:
             debug_log(f"偏好端口 {preferred_port} 被占用，嘗試清理占用進程")
             process_info = PortManager.find_process_using_port(preferred_port)
@@ -180,16 +418,18 @@ class PortManager:
                     f"端口 {preferred_port} 被進程 {process_info['name']} (PID: {process_info['pid']}) 占用"
                 )
 
-                # 詢問用戶是否清理（在實際使用中可能需要配置選項）
-                if PortManager._should_cleanup_process(process_info):
+                # 保護活躍的兄弟 MCP 實例
+                if PortRegistry.is_sibling_mcp_process(preferred_port):
+                    debug_log(
+                        f"端口 {preferred_port} 由活躍的兄弟 MCP 實例占用，跳過清理"
+                    )
+                elif PortManager._should_cleanup_process(process_info):
                     if PortManager.kill_process_on_port(preferred_port):
-                        # 等待一下讓端口釋放
                         time.sleep(1)
                         if PortManager.is_port_available(host, preferred_port):
                             debug_log(f"成功清理端口 {preferred_port}，現在可用")
                             return preferred_port
 
-        # 如果偏好端口仍不可用，尋找其他端口
         debug_log(f"偏好端口 {preferred_port} 不可用，尋找其他可用端口")
 
         for i in range(max_attempts):
@@ -198,10 +438,9 @@ class PortManager:
                 debug_log(f"找到可用端口: {port}")
                 return port
 
-        # 如果向上查找失敗，嘗試向下查找
         for i in range(1, min(preferred_port - 1024, max_attempts)):
             port = preferred_port - i
-            if port < 1024:  # 避免使用系統保留端口
+            if port < 1024:
                 break
             if PortManager.is_port_available(host, port):
                 debug_log(f"找到可用端口: {port}")
@@ -217,30 +456,46 @@ class PortManager:
         """
         判斷是否應該清理指定進程
 
+        多實例場景下，絕不清理活躍的兄弟 MCP 實例。
+        呼叫端應先透過 PortRegistry.is_sibling_mcp_process() 排除兄弟進程。
+
         Args:
             process_info: 進程信息字典
 
         Returns:
             bool: 是否應該清理該進程
         """
-        # 檢查是否是 MCP Feedback Enhanced 相關進程
         cmdline = process_info.get("cmdline", "").lower()
         process_name = process_info.get("name", "").lower()
+        pid = process_info.get("pid")
 
-        # 如果是自己的進程，允許清理
-        if any(
+        if pid == os.getpid():
+            debug_log("跳過清理：目標進程是當前進程自身")
+            return False
+
+        is_mcp_process = any(
             keyword in cmdline
             for keyword in ["mcp-feedback-enhanced", "mcp_feedback_enhanced"]
-        ):
-            return True
-
-        # 如果是 Python 進程且命令行包含相關關鍵字
-        if "python" in process_name and any(
+        )
+        is_related_python = "python" in process_name and any(
             keyword in cmdline for keyword in ["uvicorn", "fastapi"]
-        ):
+        )
+
+        if is_mcp_process or is_related_python:
+            # 額外安全檢查：如果此 PID 在注冊表中，說明是活躍兄弟
+            try:
+                active = PortRegistry.get_active_instances()
+                for _port_str, info in active.items():
+                    if info.get("pid") == pid:
+                        debug_log(
+                            f"進程 {process_info['name']} (PID: {pid}) "
+                            f"是注冊表中的活躍 MCP 實例，跳過清理"
+                        )
+                        return False
+            except Exception:
+                pass
             return True
 
-        # 其他情況下，為了安全起見，不自動清理
         debug_log(
             f"進程 {process_info['name']} (PID: {process_info['pid']}) 不是 MCP 相關進程，跳過自動清理"
         )
