@@ -269,7 +269,13 @@
         },
         "copySessionContent": "复制会话内容",
         "copyUserContent": "复制用户内容",
-        "exportSession": "导出此会话"
+        "exportSession": "导出此会话",
+        "crossPort": {
+            "title": "其他端口会话",
+            "jumpToPort": "前往端口 {port}",
+            "port": "端口",
+            "noRemoteSessions": "暂无其他端口的会话"
+        }
     },
     "sessionHistory": {
         "management": {

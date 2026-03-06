@@ -1426,3 +1426,53 @@
     font-size: 12px;
   }
 }
+
+/* === 跨端口會話區域 === */
+.cross-port-section {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border-color);
+}
+
+.cross-port-section h4 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.cross-port-section h4::before {
+  content: '🌐';
+}
+
+.session-card.cross-port-card {
+  border-left: 3px solid var(--accent-color);
+}
+
+.session-card.cross-port-card .session-header {
+  gap: 8px;
+}
+
+.port-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: monospace;
+  background: var(--accent-color);
+  color: #fff;
+  white-space: nowrap;
+}
+
+.btn-jump-port {
+  background: var(--accent-color) !important;
+  color: #fff !important;
+  border: none !important;
+  font-weight: 600;
+}
+
+.btn-jump-port:hover {
+  opacity: 0.85;
+}

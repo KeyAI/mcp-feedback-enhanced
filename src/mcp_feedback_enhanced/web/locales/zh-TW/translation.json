@@ -275,7 +275,13 @@
         "noSummary": "無摘要",
         "copySessionContent": "複製會話內容",
         "copyUserContent": "複製用戶內容",
-        "exportSession": "匯出此會話"
+        "exportSession": "匯出此會話",
+        "crossPort": {
+            "title": "其他端口會話",
+            "jumpToPort": "前往端口 {port}",
+            "port": "端口",
+            "noRemoteSessions": "暫無其他端口的會話"
+        }
     },
     "sessionHistory": {
         "management": {

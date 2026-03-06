@@ -535,7 +535,9 @@ class WebFeedbackSession:
         self.settings = settings or {}
         self.images = self._process_images(images)
 
-        # 進入下一步：等待中 → 已提交反饋
+        # 推進狀態至 FEEDBACK_SUBMITTED（可能需要多步：WAITING→ACTIVE→FEEDBACK_SUBMITTED）
+        if self.status == SessionStatus.WAITING:
+            self.next_step("處理回饋中")
         self.next_step("已送出反饋，等待下次 MCP 調用")
 
         self.feedback_completed.set()

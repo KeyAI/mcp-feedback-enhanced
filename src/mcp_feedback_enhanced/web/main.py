@@ -135,6 +135,7 @@ class WebUIManager:
         self.server_thread: threading.Thread | None = None
         self.server_process = None
         self.desktop_app_instance: Any = None  # 桌面應用實例引用
+        self._uvicorn_server: Any = None  # uvicorn Server 實例引用
 
         # 初始化標記，用於追蹤異步初始化狀態
         self._initialization_complete = False
@@ -561,6 +562,7 @@ class WebUIManager:
                     )
 
                     server_instance = uvicorn.Server(config)
+                    self._uvicorn_server = server_instance
 
                     # 創建事件循環並啟動服務器
                     async def serve_with_async_init(server=server_instance):
@@ -1069,6 +1071,15 @@ class WebUIManager:
                 expired_sessions.append(session_id)
         return expired_sessions
 
+    def has_pending_sessions(self) -> bool:
+        """檢查是否有待處理的會話（waiting 或 active 狀態）"""
+        if self.current_session and self.current_session.is_active():
+            return True
+        for session in self.sessions.values():
+            if session.is_active():
+                return True
+        return False
+
     def stop(self):
         """停止 Web UI 服務"""
         # 清理所有會話
@@ -1105,9 +1116,22 @@ class WebUIManager:
         # 從端口注冊表釋放端口
         PortRegistry.release_port(self.port)
 
-        # 停止伺服器（注意：uvicorn 的 graceful shutdown 需要額外處理）
+        # 優雅停止 uvicorn 伺服器
+        if self._uvicorn_server is not None:
+            debug_log(f"正在優雅停止 uvicorn 伺服器 (port={self.port})")
+            self._uvicorn_server.should_exit = True
+
         if self.server_thread is not None and self.server_thread.is_alive():
-            debug_log("正在停止 Web UI 服務")
+            debug_log("等待伺服器線程結束...")
+            self.server_thread.join(timeout=5)
+            if self.server_thread.is_alive():
+                debug_log("伺服器線程未在 5 秒內結束，放棄等待")
+            else:
+                debug_log("伺服器線程已結束")
+            self.server_thread = None
+
+        self._uvicorn_server = None
+        debug_log(f"Web UI 服務已停止 (port={self.port})")
 
 
 class WebUIPool:
@@ -1115,18 +1139,31 @@ class WebUIPool:
 
     同一 MCP 進程中，多個 interactive_feedback 並發調用各自獲得獨立的
     WebUIManager 實例（獨立端口、獨立 Web UI）。順序調用復用空閒管理器。
+    空閒管理器在超時後自動關閉，釋放端口資源。
     """
 
     def __init__(self):
         self._idle: list[WebUIManager] = []
         self._busy: dict[str, WebUIManager] = {}
+        self._idle_timers: dict[int, threading.Timer] = {}  # port -> Timer
         self._lock = threading.Lock()
+
+        # 空閒超時（秒），可通過環境變數自定義
+        idle_timeout_str = os.environ.get("MCP_IDLE_TIMEOUT", "300")
+        try:
+            self._idle_timeout = max(30, int(idle_timeout_str))
+        except (ValueError, TypeError):
+            self._idle_timeout = 300
+
+        debug_log(f"WebUIPool 初始化，空閒超時: {self._idle_timeout}秒")
 
     def acquire(self) -> WebUIManager:
         """獲取可用的 WebUIManager（優先復用空閒的，否則創建新的）"""
         with self._lock:
             if self._idle:
                 manager = self._idle.pop(0)
+                # 取消該管理器的空閒計時器
+                self._cancel_idle_timer(manager.port)
                 debug_log(
                     f"復用空閒 WebUIManager (port={manager.port})，"
                     f"空閒池剩餘: {len(self._idle)}"
@@ -1141,24 +1178,83 @@ class WebUIPool:
         """將管理器標記為忙碌"""
         with self._lock:
             self._busy[session_id] = manager
+            self._cancel_idle_timer(manager.port)
 
     def release(self, session_id: str):
-        """釋放管理器回空閒池"""
+        """釋放管理器回空閒池，並啟動空閒計時器"""
         with self._lock:
             manager = self._busy.pop(session_id, None)
             if manager:
                 self._idle.append(manager)
+                self._start_idle_timer(manager)
                 debug_log(
                     f"WebUIManager (port={manager.port}) 釋放回池，"
-                    f"空閒: {len(self._idle)}，忙碌: {len(self._busy)}"
+                    f"空閒: {len(self._idle)}，忙碌: {len(self._busy)}，"
+                    f"{self._idle_timeout}秒後自動關閉"
                 )
+
+    def _start_idle_timer(self, manager: WebUIManager):
+        """啟動空閒計時器（必須在鎖內調用）"""
+        port = manager.port
+        self._cancel_idle_timer(port)
+
+        def on_idle_timeout():
+            self._handle_idle_timeout(port)
+
+        timer = threading.Timer(self._idle_timeout, on_idle_timeout)
+        timer.daemon = True
+        timer.start()
+        self._idle_timers[port] = timer
+
+    def _cancel_idle_timer(self, port: int):
+        """取消空閒計時器（必須在鎖內調用）"""
+        timer = self._idle_timers.pop(port, None)
+        if timer:
+            timer.cancel()
+
+    def _handle_idle_timeout(self, port: int):
+        """空閒超時回調：關閉並移除空閒管理器"""
+        manager_to_stop = None
+        with self._lock:
+            # 找到對應的空閒管理器
+            for i, m in enumerate(self._idle):
+                if m.port == port:
+                    # 確認沒有待處理的會話
+                    if not m.has_pending_sessions():
+                        manager_to_stop = self._idle.pop(i)
+                        self._idle_timers.pop(port, None)
+                        debug_log(
+                            f"空閒超時：準備關閉 WebUIManager (port={port})，"
+                            f"空閒池剩餘: {len(self._idle)}"
+                        )
+                    else:
+                        debug_log(
+                            f"空閒超時觸發但 port={port} 仍有待處理會話，跳過關閉"
+                        )
+                        # 重新啟動計時器
+                        self._start_idle_timer(m)
+                    break
+
+        # 在鎖外執行停止操作（可能耗時）
+        if manager_to_stop:
+            try:
+                manager_to_stop.stop()
+                debug_log(f"空閒 WebUIManager (port={port}) 已自動關閉")
+            except Exception as e:
+                debug_log(f"自動關閉空閒 WebUIManager (port={port}) 失敗: {e}")
 
     def stop_all(self):
         """停止所有管理器並清空池"""
         with self._lock:
+            # 取消所有空閒計時器
+            for timer in self._idle_timers.values():
+                timer.cancel()
+            self._idle_timers.clear()
+
             all_managers = self._idle + list(self._busy.values())
             self._idle.clear()
             self._busy.clear()
+
         for manager in all_managers:
             try:
                 manager.stop()
@@ -1174,6 +1270,11 @@ class WebUIPool:
             if self._idle:
                 return self._idle[0]
         return WebUIManager()
+
+    def get_all_managers(self) -> list[WebUIManager]:
+        """獲取所有管理器（用於跨端口查詢）"""
+        with self._lock:
+            return list(self._busy.values()) + list(self._idle)
 
 
 # 全域管理器池

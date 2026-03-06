@@ -26,6 +26,11 @@
         this.sessionHistory = [];
         this.lastStatusUpdate = null;
 
+        // 跨端口會話數據
+        this.crossPortInstances = [];
+        this.currentPort = null;
+        this.currentHost = null;
+
         // 統計數據
         this.sessionStats = {
             todayCount: 0,
@@ -40,10 +45,25 @@
         this.onHistoryChange = options.onHistoryChange || null;
         this.onStatsChange = options.onStatsChange || null;
         this.onDataChanged = options.onDataChanged || null;
+        this.onCrossPortChange = options.onCrossPortChange || null;
+
+        // 跨端口輪詢定時器
+        this._crossPortTimer = null;
+        this._crossPortInterval = 10000; // 10 秒
 
         // 初始化：載入歷史記錄並清理過期資料
-        // 注意：loadFromServer 是異步的，會在載入完成後自動觸發更新
         this.loadFromServer();
+
+        // 延遲初始化跨端口功能，避免阻塞核心初始化流程
+        var self = this;
+        setTimeout(function() {
+            try {
+                self.loadCrossPortSessions();
+                self._startCrossPortPolling();
+            } catch (e) {
+                console.warn('📊 跨端口會話功能初始化失敗:', e);
+            }
+        }, 500);
 
         console.log('📊 SessionDataManager 初始化完成');
     }
@@ -876,6 +896,62 @@
 
 
     /**
+     * 載入跨端口會話數據
+     */
+    SessionDataManager.prototype.loadCrossPortSessions = function() {
+        var self = this;
+
+        fetch('/api/all-instances-sessions')
+            .then(function(response) {
+                if (response.ok) {
+                    return response.json();
+                }
+                throw new Error('HTTP ' + response.status);
+            })
+            .then(function(data) {
+                if (data && Array.isArray(data.instances)) {
+                    self.crossPortInstances = data.instances;
+                    self.currentPort = data.current_port;
+                    self.currentHost = data.current_host;
+
+                    if (self.onCrossPortChange) {
+                        self.onCrossPortChange(self.crossPortInstances, self.currentPort);
+                    }
+                }
+            })
+            .catch(function(error) {
+                console.warn('📊 載入跨端口會話失敗:', error);
+            });
+    };
+
+    /**
+     * 獲取跨端口實例數據
+     */
+    SessionDataManager.prototype.getCrossPortInstances = function() {
+        return this.crossPortInstances;
+    };
+
+    /**
+     * 獲取當前端口
+     */
+    SessionDataManager.prototype.getCurrentPort = function() {
+        return this.currentPort;
+    };
+
+    /**
+     * 啟動跨端口會話輪詢
+     */
+    SessionDataManager.prototype._startCrossPortPolling = function() {
+        var self = this;
+        if (this._crossPortTimer) {
+            clearInterval(this._crossPortTimer);
+        }
+        this._crossPortTimer = setInterval(function() {
+            self.loadCrossPortSessions();
+        }, this._crossPortInterval);
+    };
+
+    /**
      * 清理過期的會話
      */
     SessionDataManager.prototype.cleanupExpiredSessions = function() {
@@ -1021,8 +1097,14 @@
      * 清理資源
      */
     SessionDataManager.prototype.cleanup = function() {
+        if (this._crossPortTimer) {
+            clearInterval(this._crossPortTimer);
+            this._crossPortTimer = null;
+        }
+
         this.currentSession = null;
         this.sessionHistory = [];
+        this.crossPortInstances = [];
         this.lastStatusUpdate = null;
         this.sessionStats = {
             todayCount: 0,

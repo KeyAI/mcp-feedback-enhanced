@@ -71,6 +71,7 @@
     SessionUIRenderer.prototype.initializeElements = function() {
         this.currentSessionCard = DOMUtils.safeQuerySelector('#currentSessionCard');
         this.historyList = DOMUtils.safeQuerySelector('#sessionHistoryList');
+        this.crossPortList = DOMUtils.safeQuerySelector('#crossPortSessionList');
 
         // 統計元素
         this.statsElements = {
@@ -778,6 +779,134 @@
             const timeText = TimeUtils.formatElapsedTime(this.currentSessionData.created_at);
             DOMUtils.safeSetTextContent(activeTimeElement, timeText);
         }
+    };
+
+    /**
+     * 渲染跨端口會話列表
+     */
+    SessionUIRenderer.prototype.renderCrossPortSessions = function(instances, currentPort) {
+        if (!this.crossPortList || !instances) return;
+
+        // 過濾出其他端口的實例（有會話的）
+        var remoteInstances = instances.filter(function(inst) {
+            return !inst.is_self && inst.sessions && inst.sessions.length > 0;
+        });
+
+        // 如果沒有其他端口的會話，隱藏區域
+        var container = this.crossPortList.closest('.cross-port-section');
+        if (container) {
+            container.style.display = remoteInstances.length > 0 ? '' : 'none';
+        }
+
+        if (remoteInstances.length === 0) {
+            DOMUtils.clearElement(this.crossPortList);
+            return;
+        }
+
+        DOMUtils.clearElement(this.crossPortList);
+
+        var fragment = document.createDocumentFragment();
+        var i18n = window.i18nManager;
+
+        remoteInstances.forEach(function(instance) {
+            instance.sessions.forEach(function(session) {
+                var card = DOMUtils.createElement('div', {
+                    className: 'session-card cross-port-card'
+                });
+
+                // Header: port badge + status
+                var header = DOMUtils.createElement('div', { className: 'session-header' });
+
+                var portBadge = DOMUtils.createElement('span', {
+                    className: 'port-badge',
+                    textContent: ':' + instance.port
+                });
+
+                var statusText = StatusUtils.getStatusText(session.status);
+                var statusBadge = DOMUtils.createElement('span', {
+                    className: 'status-badge ' + (session.status || 'waiting'),
+                    textContent: statusText
+                });
+
+                header.appendChild(portBadge);
+                header.appendChild(statusBadge);
+                card.appendChild(header);
+
+                // Info section
+                var info = DOMUtils.createElement('div', { className: 'session-info' });
+
+                // Session ID
+                var idText = (session.session_id || '').substring(0, 8) + '...';
+                var sessionIdLabel = i18n ? i18n.t('sessionManagement.sessionId') : '會話 ID';
+                var idElem = DOMUtils.createElement('div', {
+                    className: 'session-id',
+                    textContent: sessionIdLabel + ': ' + idText
+                });
+                info.appendChild(idElem);
+
+                // Time
+                if (session.created_at) {
+                    var timeText = TimeUtils.formatTimestamp(session.created_at, { format: 'time' });
+                    var timeLabel = i18n ? i18n.t('sessionManagement.createdTime') : '建立時間';
+                    var timeElem = DOMUtils.createElement('div', {
+                        className: 'session-time',
+                        textContent: timeLabel + ': ' + timeText
+                    });
+                    info.appendChild(timeElem);
+                }
+
+                // Project directory (truncated)
+                if (session.project_directory) {
+                    var projLabel = i18n ? i18n.t('sessionManagement.project') : '專案';
+                    var pathResult = window.MCPFeedback.Utils.truncatePathFromRight(
+                        session.project_directory, 2, 30
+                    );
+                    var projElem = DOMUtils.createElement('div', {
+                        className: 'session-project',
+                        textContent: projLabel + ': ' + pathResult.truncated
+                    });
+                    info.appendChild(projElem);
+                }
+
+                card.appendChild(info);
+
+                // Actions: jump button for waiting/active sessions
+                var actions = DOMUtils.createElement('div', { className: 'session-actions' });
+
+                if (session.status === 'waiting' || session.status === 'active') {
+                    var jumpLabel = i18n
+                        ? i18n.t('sessionManagement.crossPort.jumpToPort', '前往端口 ' + instance.port)
+                        : '前往端口 ' + instance.port;
+                    var jumpBtn = DOMUtils.createElement('button', {
+                        className: 'btn-small btn-jump-port',
+                        textContent: jumpLabel
+                    });
+                    var targetUrl = 'http://' + instance.host + ':' + instance.port;
+                    DOMUtils.addEventListener(jumpBtn, 'click', function() {
+                        window.open(targetUrl, '_blank');
+                    });
+                    actions.appendChild(jumpBtn);
+                }
+
+                // View details button
+                var viewLabel = i18n ? i18n.t('sessionManagement.viewDetails') : '詳細資訊';
+                var viewBtn = DOMUtils.createElement('button', {
+                    className: 'btn-small',
+                    textContent: viewLabel
+                });
+                DOMUtils.addEventListener(viewBtn, 'click', function() {
+                    if (window.MCPFeedback && window.MCPFeedback.SessionManager) {
+                        window.MCPFeedback.SessionManager.viewSessionDetails(session.session_id);
+                    }
+                });
+                actions.appendChild(viewBtn);
+
+                card.appendChild(actions);
+                fragment.appendChild(card);
+            });
+        });
+
+        this.crossPortList.appendChild(fragment);
     };
 
     /**

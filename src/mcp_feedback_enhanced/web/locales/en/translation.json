@@ -268,7 +268,13 @@
         },
         "copySessionContent": "Copy Session Content",
         "copyUserContent": "Copy User Content",
-        "exportSession": "Export This Session"
+        "exportSession": "Export This Session",
+        "crossPort": {
+            "title": "Other Port Sessions",
+            "jumpToPort": "Go to port {port}",
+            "port": "Port",
+            "noRemoteSessions": "No sessions on other ports"
+        }
     },
     "sessionHistory": {
         "management": {

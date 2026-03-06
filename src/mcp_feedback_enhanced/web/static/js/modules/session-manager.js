@@ -80,6 +80,9 @@
             },
             onDataChanged: function() {
                 self.handleDataChanged();
+            },
+            onCrossPortChange: function(instances, currentPort) {
+                self.handleCrossPortChange(instances, currentPort);
             }
         });
     };
@@ -206,12 +209,14 @@
      * 處理資料變更（原始版本，供防抖使用）
      */
     SessionManager.prototype._originalHandleDataChanged = function() {
+        if (!this.dataManager || !this.uiRenderer) {
+            return;
+        }
         console.log('📋 處理資料變更，重新渲染所有內容');
 
-        // 重新渲染所有內容
-        const currentSession = this.dataManager.getCurrentSession();
-        const history = this.dataManager.getSessionHistory();
-        const stats = this.dataManager.getStats();
+        var currentSession = this.dataManager.getCurrentSession();
+        var history = this.dataManager.getSessionHistory();
+        var stats = this.dataManager.getStats();
 
         this.uiRenderer.renderCurrentSession(currentSession);
         this.uiRenderer.renderSessionHistory(history);
@@ -227,6 +232,15 @@
         } else {
             // 回退到原始方法（防抖未初始化時）
             this._originalHandleDataChanged();
+        }
+    };
+
+    /**
+     * 處理跨端口會話變更
+     */
+    SessionManager.prototype.handleCrossPortChange = function(instances, currentPort) {
+        if (this.uiRenderer) {
+            this.uiRenderer.renderCrossPortSessions(instances, currentPort);
         }
     };
 

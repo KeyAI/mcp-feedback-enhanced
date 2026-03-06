@@ -11,12 +11,14 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import aiohttp
 from fastapi import Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from ... import __version__
 from ...debug import web_debug_log as debug_log
 from ..constants import get_message_code as get_msg_code
+from ..utils.port_manager import PortRegistry
 
 
 if TYPE_CHECKING:
@@ -213,6 +215,99 @@ def setup_routes(manager: "WebUIManager"):
                 status_code=500,
                 content={
                     "error": f"Failed to get sessions: {e!s}",
+                    "messageCode": get_msg_code("get_sessions_failed"),
+                },
+            )
+
+    @manager.app.get("/api/all-instances-sessions")
+    async def get_all_instances_sessions(request: Request):
+        """獲取所有端口實例的會話信息（跨端口聚合）"""
+        try:
+            current_port = manager.port
+            current_host = manager.host
+            all_instances = []
+
+            # 1. 收集本端口的會話數據
+            local_sessions = []
+            for session_id, session in manager.sessions.items():
+                local_sessions.append({
+                    "session_id": session.session_id,
+                    "project_directory": session.project_directory,
+                    "summary": session.summary,
+                    "status": session.status.value,
+                    "status_message": session.status_message,
+                    "created_at": int(session.created_at * 1000),
+                    "last_activity": int(session.last_activity * 1000),
+                    "feedback_completed": session.feedback_completed.is_set(),
+                    "has_websocket": session.websocket is not None,
+                    "is_current": session == manager.current_session,
+                })
+
+            all_instances.append({
+                "port": current_port,
+                "host": current_host,
+                "is_self": True,
+                "sessions": local_sessions,
+            })
+
+            # 2. 從 PortRegistry 獲取其他活躍端口並查詢會話
+            active_ports = PortRegistry.get_active_instances()
+            remote_fetch_tasks = []
+
+            for port_str, info in active_ports.items():
+                port = int(port_str)
+                if port == current_port:
+                    continue
+                remote_fetch_tasks.append((port, current_host))
+
+            # 並行請求其他端口
+            if remote_fetch_tasks:
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=3)
+                ) as http_session:
+                    for port, host in remote_fetch_tasks:
+                        try:
+                            url = f"http://{host}:{port}/api/all-sessions"
+                            async with http_session.get(url) as resp:
+                                if resp.status == 200:
+                                    data = await resp.json()
+                                    remote_sessions = data.get("sessions", [])
+                                    # 補充端口信息
+                                    for s in remote_sessions:
+                                        s["is_current"] = False
+                                    all_instances.append({
+                                        "port": port,
+                                        "host": host,
+                                        "is_self": False,
+                                        "sessions": remote_sessions,
+                                    })
+                                    debug_log(
+                                        f"從端口 {port} 獲取到 {len(remote_sessions)} 個會話"
+                                    )
+                                else:
+                                    debug_log(
+                                        f"從端口 {port} 獲取會話失敗: HTTP {resp.status}"
+                                    )
+                        except Exception as e:
+                            debug_log(f"從端口 {port} 獲取會話失敗: {e}")
+                            continue
+
+            debug_log(
+                f"跨端口會話聚合完成: {len(all_instances)} 個實例"
+            )
+
+            return JSONResponse(content={
+                "instances": all_instances,
+                "current_port": current_port,
+                "current_host": current_host,
+            })
+
+        except Exception as e:
+            debug_log(f"獲取跨端口會話失敗: {e}")
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": f"Failed to get cross-instance sessions: {e!s}",
                     "messageCode": get_msg_code("get_sessions_failed"),
                 },
             )
